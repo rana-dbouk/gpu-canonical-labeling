@@ -1,4 +1,4 @@
-# Accelerating Canonical Labeling for GPU-Parallel Graph Isomorphism
+# Accelerating Canonical Labeling for Solving Graph Isomorphism on GPUs
 
 GPU-parallel canonical labeling for graph isomorphism based on the individualization--refinement framework underlying the state-of-the-art practical canonical-labeling tool [nauty](https://pallini.di.uniroma1.it/) [1].
 

@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -123,9 +124,10 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        auto canonicalize = [&](CSRGraph& graph) {
+        auto canonicalize = [&](CSRGraph& graph, const std::string& filename) {
             if (use_parallel) {
-                return Nauty_Parallel(graph, max_aut);
+                const std::string prefix = std::filesystem::path(filename).stem().string();
+                return Nauty_Parallel(graph, max_aut, nullptr, prefix);
             }
 
             Nauty_Sequential nauty(graph, max_aut);
@@ -144,7 +146,7 @@ int main(int argc, char* argv[]) {
 
         if (graph_files.size() == 1) {
             CSRGraph graph = CSRGraph::fromDIMACS(graph_files[0]);
-            std::vector<unsigned char> canon = canonicalize(graph);
+            std::vector<unsigned char> canon = canonicalize(graph, graph_files[0]);
 
             if (canon.empty()) {
                 std::cerr << "[ERROR] Canonical labeling failed.\n";
@@ -173,11 +175,11 @@ int main(int argc, char* argv[]) {
 
         std::cout << "\nGraph 1: " << graph_files[0] << "\n";
         std::cout << "Computing canonical form...\n";
-        std::vector<unsigned char> canon1 = canonicalize(graph1);
+        std::vector<unsigned char> canon1 = canonicalize(graph1, graph_files[0]);
 
         std::cout << "\nGraph 2: " << graph_files[1] << "\n";
         std::cout << "Computing canonical form...\n";
-        std::vector<unsigned char> canon2 = canonicalize(graph2);
+        std::vector<unsigned char> canon2 = canonicalize(graph2, graph_files[1]);
 
         if (canon1.empty() || canon2.empty()) {
             std::cerr << "[ERROR] Canonical labeling failed.\n";

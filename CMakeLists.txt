@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
 project(GPUCanonicalLabeling LANGUAGES CXX CUDA)
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -24,3 +28,5 @@ target_compile_options(gpu_canon_label PRIVATE
         -Xptxas=--maxrregcount=32
     >
 )
+
+

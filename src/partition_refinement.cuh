@@ -323,7 +323,6 @@ __device__ int partition_refinement_p(
              * bucket[d] is first used as the count of vertices with degree d.
              * Later, bucket[d] is converted into the write position for degree d.
              * Every vertex in the current cell has a degree between bmin_sh and bmax_sh. 
-             * The subsequent histogram and fragment construction only use buckets in that range, so other buckets do not need clearing.
              */
 
             for (unsigned int d = bmin_sh + threadIdx.x; d <= bmax_sh; d += blockDim.x) {

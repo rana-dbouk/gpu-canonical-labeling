@@ -39,10 +39,10 @@ __global__ void nauty_parallel_kernel(
     initializeCounters(&blockCounters);
     cuda::atomic_ref<int, cuda::thread_scope_device> first_leaf_ready(d_first_leaf->discovered);
     
-    __shared__ unsigned int sm_id;
-    if (threadIdx.x==0){
-        sm_id=get_smid();
-    }
+    // __shared__ unsigned int sm_id;
+    // if (threadIdx.x==0){
+    //     sm_id=get_smid();
+    // }
 
     Partition& part = partitions[blockId];
     CSRGraph& graph = d_graph[0];  
@@ -58,7 +58,7 @@ __global__ void nauty_parallel_kernel(
 
     int code, target_cell_index;
     startTime(PREPARE_ROOT,&blockCounters);
-    code = partition_refinement_p(part, graph, subsequence, 0, buffer , aux_arrays, counters);
+    code = partition_refinement_p(part, graph, subsequence, 0, buffer , aux_arrays, &blockCounters);
     
     if(threadIdx.x == 0){
         my_canon_code[part.level - 1] = code;
@@ -80,6 +80,9 @@ __global__ void nauty_parallel_kernel(
         }
         //if (threadIdx.x == 0) printf("[blk %u] EXIT: discrete\n", blockId);
         endTime(PREPARE_ROOT,&blockCounters);
+#if USE_COUNTERS
+        if (threadIdx.x == 0) counters[blockIdx.x] = blockCounters;
+#endif
         return;
     }
 
@@ -108,11 +111,14 @@ __global__ void nauty_parallel_kernel(
 
     // 2) This block marks its lane (k = blockIdx.x, k += gridDim.x) to 2
     //    Block 0 will naturally mark the first branch (k=0) as 2.
-    for (unsigned k = blockIdx.x; k < len; k += gridDim.x) {
-        int v = part.element_vec[first + k];
-        tc.elems[v] = v;                       // owned by this block
+    if (threadIdx.x == 0) {
+        for (unsigned k = blockIdx.x; k < len; k += gridDim.x) {
+            int v = part.element_vec[first + k];
+            tc.elems[v] = v;
+        }
     }
-    
+    __syncthreads();
+
     if(threadIdx.x == 0){
         top_tc_level[blockIdx.x] = 1;
     }
@@ -318,7 +324,9 @@ __global__ void nauty_parallel_kernel(
         //__syncthreads();
         
         if(threadIdx.x == 0){
-           num_aut_current = *d_num_aut;
+           cuda::atomic_ref<int, cuda::thread_scope_device> count(
+               *const_cast<int*>(d_num_aut));
+           num_aut_current = count.load(cuda::memory_order_relaxed);
         }
         __syncthreads();
         
@@ -449,6 +457,10 @@ __global__ void nauty_parallel_kernel(
             counters[blockIdx.x] = blockCounters;
         }
     #endif
+    if (threadIdx.x == 0) {
+        counters[blockIdx.x].rejected_best_reads = blockCounters.rejected_best_reads;
+        counters[blockIdx.x].accepted_best_reads = blockCounters.accepted_best_reads;
+    }
     
 }
 
@@ -794,6 +806,7 @@ std::vector<unsigned char> Nauty_Parallel(CSRGraph& graph,int max_aut,unsigned i
 
     Counters* counters_d = nullptr;
     CUDA_CHECK(cudaMalloc((void**)&counters_d, (size_t)total_num_blocks * sizeof(Counters)));
+    CUDA_CHECK(cudaMemset(counters_d, 0, (size_t)total_num_blocks * sizeof(Counters)));
 
     printf("Launching kernel with %d blocks and %d threads per block\n",
            total_num_blocks, threads_per_block);
@@ -866,6 +879,30 @@ std::vector<unsigned char> Nauty_Parallel(CSRGraph& graph,int max_aut,unsigned i
     
 
 
+    {
+        std::vector<Counters> read_counts((size_t)total_num_blocks);
+        CUDA_CHECK(cudaMemcpy(read_counts.data(), counters_d,
+                              read_counts.size() * sizeof(Counters), cudaMemcpyDeviceToHost));
+        const std::string filename = output_prefix.empty()
+            ? "seqlock_read_rejections.csv" : output_prefix + "_read_rejections.csv";
+        FILE* csv = fopen(filename.c_str(), "w");
+        if (!csv) {
+            perror(filename.c_str());
+        } else {
+            fprintf(csv, "BLOCK_NO,REJECTED_BEST_READS,ACCEPTED_BEST_READS,REJECTED_PCT,ACCEPTED_PCT\n");
+            for (size_t i = 0; i < read_counts.size(); ++i) {
+                const auto rejected = read_counts[i].rejected_best_reads;
+                const auto accepted = read_counts[i].accepted_best_reads;
+                const double total = (double)rejected + (double)accepted;
+                fprintf(csv, "%zu,%llu,%llu,%.2f,%.2f\n", i, rejected, accepted,
+                        total > 0 ? 100.0 * rejected / total : 0.0,
+                        total > 0 ? 100.0 * accepted / total : 0.0);
+            }
+            fclose(csv);
+            printf("[INFO] Read rejection CSV written to %s\n", filename.c_str());
+        }
+    }
+
 #if USE_COUNTERS
     {
         std::vector<Counters> counters_h((size_t)total_num_blocks);
@@ -892,7 +929,8 @@ std::vector<unsigned char> Nauty_Parallel(CSRGraph& graph,int max_aut,unsigned i
                 "VERIFY_SEQUENCE_pct,"
                 "SPLIT_BY_AND_REFINE_pct,"
                 "CLASSIFY_NODE_pct,"
-                "WAIT_BEST_LEAF_LOCK_pct\n"
+                "WAIT_BEST_LEAF_LOCK_pct,"
+                "WAIT_BEST_EVEN_VERSION_pct\n"
             );
 
             for (unsigned int i = 0; i < (unsigned)total_num_blocks; ++i) {
@@ -919,6 +957,7 @@ std::vector<unsigned char> Nauty_Parallel(CSRGraph& graph,int max_aut,unsigned i
                 print_pct(SPLIT_BY_AND_REFINE);
                 print_pct(CLASSIFY_NODE);
                 print_pct(WAIT_BEST_LEAF_LOCK);
+                print_pct(WAIT_BEST_EVEN_VERSION);
 
                 fprintf(fp, "\n");
             }

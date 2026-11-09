@@ -2,6 +2,51 @@
 #include "CSRGraph.h"
 #include <algorithm>
 #include <cuda/atomic>
+
+#ifndef USE_BEST_SEQLOCK
+#define USE_BEST_SEQLOCK 1
+#endif
+
+
+template<class T>
+__device__ __forceinline__ T best_load(volatile T& value) {
+#if USE_BEST_SEQLOCK
+    cuda::atomic_ref<T, cuda::thread_scope_device> ref(*const_cast<T*>(&value));
+    return ref.load(cuda::memory_order_seq_cst);
+#else
+    return value; 
+#endif
+}
+template<class T>
+__device__ __forceinline__ void best_store(volatile T& destination, T value) {
+#if USE_BEST_SEQLOCK
+    cuda::atomic_ref<T, cuda::thread_scope_device> ref(*const_cast<T*>(&destination));
+    ref.store(value, cuda::memory_order_seq_cst);
+#else
+    destination = value;
+#endif
+}
+
+
+__device__ __forceinline__ void wait_for_automorphism(volatile int* perm, unsigned n) {
+    cuda::atomic_ref<int, cuda::thread_scope_device> ready(*const_cast<int*>(&perm[n - 1]));
+    while (ready.load(cuda::memory_order_acquire) == -1) __nanosleep(100);
+}
+
+__device__ __forceinline__ int automorphism_entry(volatile int* perm, unsigned v, unsigned n) {
+    if (v == n - 1) {
+        cuda::atomic_ref<int, cuda::thread_scope_device> ready(*const_cast<int*>(&perm[v]));
+        return ready.load(cuda::memory_order_relaxed);
+    }
+    return perm[v];
+}
+
+
+__device__ __forceinline__ void publish_automorphism(volatile int* perm, unsigned n, int value) {
+    cuda::atomic_ref<int, cuda::thread_scope_device> ready(*const_cast<int*>(&perm[n - 1]));
+    ready.store(value, cuda::memory_order_release);
+}
+
 #define PRUNED_MARK (2)
 
 __device__ int get_smid(void) {
@@ -25,13 +70,13 @@ struct DSU_dev {
     }
 
     __device__ unsigned int find_root(unsigned int x) const {
-        
-        unsigned int p = parent[x];
-        
+        cuda::atomic_ref<unsigned int, cuda::thread_scope_device> first(parent[x]);
+        unsigned int p = first.load(cuda::memory_order_relaxed);
+
         while (p != x) {
-            
             x = p;
-            p = parent[x];
+            cuda::atomic_ref<unsigned int, cuda::thread_scope_device> next(parent[x]);
+            p = next.load(cuda::memory_order_relaxed);
         }
         return x;
     }
@@ -168,7 +213,7 @@ __device__ int compare_adj_upper(volatile bool* A, volatile bool* B, unsigned n)
         
         for (unsigned j = i + 1 + threadIdx.x; j < n; j += blockDim.x) {
             bool a = A[base + j];
-            bool b = B[base + j];
+            bool b = best_load(B[base + j]);
             if (a != b) {
                 atomicMin(&row_best_j, (int)j);  
                 break;                          
@@ -209,7 +254,7 @@ __device__ int lex_compare_codes(const int* A, int lenA,
     int local = minLen;
     for (int i = threadIdx.x; i < minLen; i += blockDim.x) {
         int a = A[i];
-        int b = B[i];           
+        int b = best_load(B[i]);           
         if (a != b) { local = i; break; }
     }
 
@@ -232,7 +277,7 @@ __device__ int lex_compare_codes(const int* A, int lenA,
     if (threadIdx.x == 0) {
         if (s_best < minLen) {
             int a = A[s_best];
-            int b = B[s_best];
+            int b = best_load(B[s_best]);
             s_res = (a > b) - (a < b);
             *first_mismatch_idx = s_best;
         } else {
@@ -514,21 +559,21 @@ __device__ int verify_vertex_sequence_orbit_reps(
         for (int ii = threadIdx.x + last_num_aut_at_level ; ii < num_aut; ii += blockDim.x) {
             
             
-            while (found_automorphisms[ii * num_vertices + num_vertices - 1] == -1) { __nanosleep(100);    }
+            wait_for_automorphism(&found_automorphisms[ii * num_vertices], num_vertices);
             
            
             bool fixes_all = true;
             volatile int* perm = &found_automorphisms[ii * num_vertices];
             
             for (int j = 0; j < i; ++j) {
-                if (perm[current_vertex_sequence[j]] != current_vertex_sequence[j]) {
+                if (automorphism_entry(perm, current_vertex_sequence[j], num_vertices) != current_vertex_sequence[j]) {
                     fixes_all = false;
                     break;
                 }
             }
             if (fixes_all) {
                  for (unsigned int v = 0; v < num_vertices; v ++) {
-                    unsigned int img = perm[v];
+                    unsigned int img = automorphism_entry(perm, v, num_vertices);
                     
                     
                     if (v != img) dsu.unite_atomic(v, img);
@@ -603,16 +648,14 @@ __device__ void compute_orbits_fast_p(
     
     for (int ii = threadIdx.x + last_num_aut_at_level ; ii < num_aut; ii += blockDim.x) {
             
-        while (found_automorphisms[ii * num_vertices + num_vertices - 1] == -1) { 
-            __nanosleep(100); 
-         }
+        wait_for_automorphism(&found_automorphisms[ii * num_vertices], num_vertices);
 
         
     
         bool fixes_all = true;
         volatile int* perm = &found_automorphisms[ii * num_vertices];
         for (int j = 0; j < sequence_size; ++j) {
-            if (perm[current_vertex_sequence[j]] != current_vertex_sequence[j]) {
+            if (automorphism_entry(perm, current_vertex_sequence[j], num_vertices) != current_vertex_sequence[j]) {
                 fixes_all = false;
                 break;
             }
@@ -620,7 +663,7 @@ __device__ void compute_orbits_fast_p(
         if (fixes_all) {
             for (unsigned int v = 0; v < num_vertices; v ++) {
                 
-                unsigned int img = perm[v];
+                unsigned int img = automorphism_entry(perm, v, num_vertices);
                 //printf("vertex %u mapped to %u\n",v,img);
                 if (v != img) dsu.unite_atomic(v, img);
             }
@@ -660,7 +703,9 @@ __device__ void prune_stack_entry(Partition& current_partition, volatile TargetC
     // PRUNE if new automorphisms
     __shared__ int curr_num_aut ;
     if(threadIdx.x == 0){
-        curr_num_aut = *d_num_aut;
+        cuda::atomic_ref<int, cuda::thread_scope_device> count(
+            *const_cast<int*>(d_num_aut));
+        curr_num_aut = count.load(cuda::memory_order_relaxed);
     }
     __syncthreads();
     if (curr_num_aut > 0 && curr_num_aut > tc.last_num_aut_at_level)
@@ -798,7 +843,7 @@ __device__ void classify_node(
             __syncthreads();
 
             if(threadIdx.x == 0){
-                atomicExch((int*)&d_found_automorphisms[raw * n + n - 1] , tmp_perm[n - 1]);
+                publish_automorphism(&d_found_automorphisms[raw * n], n, (int)tmp_perm[n - 1]);
                 __threadfence();
             }
 
@@ -816,334 +861,304 @@ __device__ void classify_node(
             
             return;
         }
-        endTime(CLASSIFY_NODE,blockCounters);
-        //AQUIRE LOCK to best leaf
-
-        startTime(WAIT_BEST_LEAF_LOCK,blockCounters);
-        if (threadIdx.x == 0) {
-            int expected = 0;
-            while (!best_mutex.compare_exchange_weak(
-                expected, 1,
-                cuda::memory_order_acquire,
-                cuda::memory_order_relaxed)) {
-                expected = 0;
+        __shared__ int pos, best_level, best_is_leaf;
+#if USE_BEST_SEQLOCK
+        cuda::atomic_ref<unsigned long long, cuda::thread_scope_device> version(canonical_labeling->version);
+        __shared__ unsigned long long observed_version;
+        __shared__ int accepted;
+        while (true) {
+            __syncthreads();
+#endif
+#if !USE_BEST_SEQLOCK
+            endTime(CLASSIFY_NODE, blockCounters);
+            startTime(WAIT_BEST_LEAF_LOCK, blockCounters);
+            if (threadIdx.x == 0) {
+                int expected = 0;
+                while (!best_mutex.compare_exchange_weak(expected, 1,
+                        cuda::memory_order_acquire, cuda::memory_order_relaxed)) expected = 0;
             }
-        }
-        __syncthreads();
-        endTime(WAIT_BEST_LEAF_LOCK,blockCounters);
-        
-        startTime(CLASSIFY_NODE,blockCounters);
-        __shared__ int pos;
-        
-        int lex = lex_compare_codes(my_canon_code, part.level, canonical_labeling->invar_path_value, canonical_labeling->level, &pos);
-
-        // DEBUG: show lex inputs/outputs
-        // if (threadIdx.x == 0) {
-        //     printf("[blk %u] L%u lex=%d pos=%d | my_len=%u best_len=%d\n",
-        //         (unsigned)blockIdx.x, (unsigned)part.level, lex, pos,
-        //         (unsigned)part.level, *canon_code_level);
-
-        //     // my path
-        //     printf("  my:   ");
-        //     for (int i = 0; i < (int)part.level; ++i) printf("%d ", my_canon_code[i]);
-        //     printf("\n");
-
-        //     // best path
-        //     printf("  best: ");
-        //     for (int i = 0; i < *canon_code_level; ++i) printf("%d ", d_canon_code[i]);
-        //     printf("\n");
-        // }
-
-
-        // decision = 0 : proceed normally with node
-        // decision = 1 : update global best , and it will be a full path (update hash)
-        // decision = 2 : update global best, but it will not be a full path (no update on hash)
-        // decision = 3 : backtrack one level up.
-        // decision = 4 : backtrack to "pos".
-
-        if (lex > 0) {
-            if(threadIdx.x == 0){
-                decision = 1;     // or 2 doesnt matter
+            __syncthreads();
+            endTime(WAIT_BEST_LEAF_LOCK, blockCounters);
+            startTime(CLASSIFY_NODE, blockCounters);
+#endif
+#if USE_BEST_SEQLOCK
+            if (threadIdx.x == 0) {
+                observed_version = version.load(cuda::memory_order_seq_cst);
             }
-                
-                
-            
-        } else if (lex == 0) {
-            // 2) equal canon trails → shorter level wins
-            if (part.level <  canonical_labeling->level) {
-
-                if(is_disc){  //must later check if canon code is a complete path or not
-                    if(threadIdx.x == 0){
-                        decision = 1;
-                    }
-                }
-                else{
-                    if(threadIdx.x == 0){
-                        decision = 0;  // cant take a decision yet. Procced with this path normally
-                    }
-                }
-                
-                
-            } 
-            else if (part.level ==  canonical_labeling->level) {
-                // 3) still equal → compare hashes (upper-triangular)
-                __syncthreads();
-            
-                
-                if((canonical_labeling->is_leaf)== 1 && is_disc){
-                    discrete_partition_to_perm_p(part, n, tmp_perm);
-
-                   if (threadIdx.x == 0) {
-                        int expected = 0;
-                        while (!hash_mutex.compare_exchange_weak(
-                            expected, 1,
-                            cuda::memory_order_acquire,
-                            cuda::memory_order_relaxed)) {
-                            expected = 0;
-                        }
-                    }
+            __syncthreads();
+            if (observed_version & 1ULL) {
+                endTime(CLASSIFY_NODE, blockCounters);
+                startTime(WAIT_BEST_EVEN_VERSION, blockCounters);
+                do {
                     __syncthreads();
-                    buildPermutedFlatAdjacencyMatrixArray_p(graph, tmp_perm, tmp_hash);
-                    int cmp = compare_adj_upper(tmp_hash, canonical_labeling->hash_of_perm_graph, n);
-                    
                     if (threadIdx.x == 0)
-                        hash_mutex.store(0, cuda::memory_order_release);
+                        observed_version = version.load(cuda::memory_order_seq_cst);
+                    __syncthreads();
+                } while (observed_version & 1ULL);
+                endTime(WAIT_BEST_EVEN_VERSION, blockCounters);
+                startTime(CLASSIFY_NODE, blockCounters);
+            }
+#endif
+            if (threadIdx.x == 0) {
+                decision = 0;
+                best_level = best_load(canonical_labeling->level);
+                best_is_leaf = best_load(canonical_labeling->is_leaf);
+            }
+            __syncthreads();
+            int lex = lex_compare_codes(my_canon_code, part.level,
+                canonical_labeling->invar_path_value, best_level, &pos);
 
-                    __threadfence();
+            // decision = 0 : proceed normally with node
+            // decision = 1 : update global best , and it will be a full path (update hash)
+            // decision = 2 : update global best, but it will not be a full path (no update on hash)
+            // decision = 3 : backtrack one level up.
+            // decision = 4 : backtrack to "pos".
+            // decision = 5 : aut wrt to best leaf
 
-                    if(cmp == 0){
-
-                        //automorphism discovered w.r.t current best leaf
+            if (lex > 0) {
+                if(threadIdx.x == 0){
+                    decision = 1;     // or 2 doesnt matter
+                }
+                    
+                    
                 
+            } else if (lex == 0) {
+                // 2) equal canon trails → shorter level wins
+                if (part.level <  best_level) {
 
-                        // if(threadIdx.x == 0){
-                        //     printf("block %u discovred aut at level %u\n",blockIdx.x,part.level);
-                        //     printf("current path vertex sequence:\n");
-                        //     for(int i = 0; i < part.current_vertex_sequence_size; i++){
-                        //         printf("%u ,",part.current_vertex_sequence[i]);
-                        //     }
-                        //     printf("\n");
-                        //     printf("best path vertex sequence:\n");
-                        //     for(int i = 0; i < part.current_vertex_sequence_size; i++){
-                        //         printf("%u ,",d_best_leaf->vertex_sequence[i]);
-                        //     }
-                        //     printf("\n");
-
-                        // }
-                        
-                        for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
-                            unsigned u = canonical_labeling->label[j];
-                            unsigned v = part.element_vec[j];
-                            tmp_perm[u] = v;
-                        }
-                        __syncthreads();
-
-                        
-                        if (threadIdx.x == 0) {
-                            
-                            raw =  atomicAdd((int*)d_num_aut, 1);
-                            //printf("blockid: %u level: %u found aut wrt best leaf at index %u and root part level %u \n",blockIdx.x, part.level, raw, tc_level_top[blockIdx.x]);
-                        }
-                        
-
-                        __syncthreads();
-                       for (unsigned i = threadIdx.x; i < n - 1; i += blockDim.x){
-                            d_found_automorphisms[raw * n + i] = tmp_perm[i];
-                            
-                        }
-                        __threadfence();
-                        __syncthreads();
-
-                        if(threadIdx.x == 0){
-                            atomicExch((int*)&d_found_automorphisms[raw * n + n - 1] , tmp_perm[n-1]);
-                            __threadfence();
-                            best_mutex.store(0, cuda::memory_order_release);
-                        }
-                           
-                        __threadfence();
-
-                        
-                        int g = (int)part.level - 1;
-                        backtrack_to_p(part, (unsigned)g, n, buffer,
-                                    p_eqlev_first, stack_top,tc_level_top);
-                        
-                        __syncthreads();
-                        
-                        
-                        endTime(CLASSIFY_NODE,blockCounters);
-                        return;
-
-                    }
-                    else if(cmp == -1){
-                        if(threadIdx.x == 0){
-                            //printf("blk %u equal to canon best path but lex hash worse, backtracking by one\n",blockIdx.x);
-                            decision = 3;
-                        }
-                    }
-                    else{
+                    if(is_disc){  //must later check if canon code is a complete path or not
                         if(threadIdx.x == 0){
                             decision = 1;
                         }
                     }
-
-
-                }
-
-                else if((canonical_labeling->is_leaf)== 1 && !is_disc){
+                    else{
+                        if(threadIdx.x == 0){
+                            decision = 0;  // cant take a decision yet. Proceed with this path normally
+                        }
+                    }
                     
-                    if(threadIdx.x == 0){
-                        //printf("blk %u equal to canon best path but not discrete and best path is discrete, backtracking by one\n",blockIdx.x);
-                        decision = 3; 
+                    
+                } 
+                else if (part.level ==  best_level) {
+                    // 3) still equal → compare hashes (upper-triangular)
+                    __syncthreads();
+                
+                    
+                    if((best_is_leaf)== 1 && is_disc){
+                        discrete_partition_to_perm_p(part, n, tmp_perm);
+
+                    if (threadIdx.x == 0) {
+                            int expected = 0;
+                            while (!hash_mutex.compare_exchange_weak(
+                                expected, 1,
+                                cuda::memory_order_acquire,
+                                cuda::memory_order_relaxed)) {
+                                expected = 0;
+                            }
+                        }
+                        __syncthreads();
+                        buildPermutedFlatAdjacencyMatrixArray_p(graph, tmp_perm, tmp_hash);
+                        int cmp = compare_adj_upper(tmp_hash, canonical_labeling->hash_of_perm_graph, n);
+                        
+                        if (threadIdx.x == 0)
+                            hash_mutex.store(0, cuda::memory_order_release);
+
+                        __threadfence();
+
+                        if(cmp == 0){
+
+                            //automorphism discovered w.r.t current best leaf
+                            if(threadIdx.x == 0){
+                                decision = 5;
+                            }
+                            
+
+                        }
+                        else if(cmp == -1){
+                            if(threadIdx.x == 0){
+                                //printf("blk %u equal to canon best path but lex hash worse, backtracking by one\n",blockIdx.x);
+                                decision = 3;
+                            }
+                        }
+                        else{
+                            if(threadIdx.x == 0){
+                                decision = 1;
+                            }
+                        }
+
+
                     }
 
-                    
-                }
+                    else if((best_is_leaf)== 1 && !is_disc){
+                        
+                        if(threadIdx.x == 0){
+                            //printf("blk %u equal to canon best path but not discrete and best path is discrete, backtracking by one\n",blockIdx.x);
+                            decision = 3; 
+                        }
 
-                else if ((canonical_labeling->is_leaf)== 0 && is_disc){
-
-                    if(threadIdx.x == 0){
-                        decision = 1; 
+                        
                     }
 
+                    else if ((best_is_leaf)== 0 && is_disc){
+
+                        if(threadIdx.x == 0){
+                            decision = 1; 
+                        }
+
+                    }
+                
                 }
-            
+                else{
+
+                    if((best_is_leaf)== 1){
+                        if(threadIdx.x == 0){
+                            //printf("blk %u equal to canon best path but longer than best path, backtracking by one\n",blockIdx.x);
+                            decision = 3;
+                        }
+                    }
+
+                    else if ((best_is_leaf)== 0){
+                        if (threadIdx.x == 0){
+                            decision = 1;
+                        }
+                        
+                    }
+                    
+                }
             }
             else{
 
-                if((canonical_labeling->is_leaf)== 1){
-                    if(threadIdx.x == 0){
-                        //printf("blk %u equal to canon best path but longer than best path, backtracking by one\n",blockIdx.x);
-                        decision = 3;
-                    }
-                }
-
-                else if ((canonical_labeling->is_leaf)== 0){
-                    if (threadIdx.x == 0){
-                        decision = 1;
-                    }
+                if(threadIdx.x == 0){
                     
+                    decision = 4; // backtrack up to pos.
                 }
-                
             }
-        }
-        else{
+            
+            __syncthreads();
 
-            if(threadIdx.x == 0){
-                
-                decision = 4; // backtrack up to pos.
+            if (decision == 5) {
+                for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
+                    unsigned u = (unsigned)best_load(canonical_labeling->label[j]);
+                    
+#if USE_BEST_SEQLOCK
+                    atomicExch(&tmp_perm[u], (unsigned)part.element_vec[j]);
+#else
+                    tmp_perm[u] = (unsigned)part.element_vec[j];
+#endif
+                }
             }
+            __syncthreads();
+#if !USE_BEST_SEQLOCK
+            if (decision != 1 && decision != 2) {
+                if (threadIdx.x == 0) best_mutex.store(0, cuda::memory_order_release);
+                __syncthreads();
+            }
+#else
+            if (threadIdx.x == 0) {
+                unsigned long long ending = version.load(cuda::memory_order_seq_cst);
+                accepted = ending == observed_version && !(ending & 1ULL);
+                if (accepted) ++blockCounters->accepted_best_reads;
+                else ++blockCounters->rejected_best_reads;
+            }
+            __syncthreads();
+
+            if (!accepted) continue;
+            if (decision != 1 && decision != 2) break;
+
+            endTime(CLASSIFY_NODE, blockCounters);
+            startTime(WAIT_BEST_LEAF_LOCK, blockCounters);
+            if (threadIdx.x == 0) {
+                int expected = 0;
+                while (!best_mutex.compare_exchange_weak(expected, 1,
+                        cuda::memory_order_acquire, cuda::memory_order_relaxed)) expected = 0;
+            }
+            __syncthreads();
+            endTime(WAIT_BEST_LEAF_LOCK, blockCounters);
+            startTime(CLASSIFY_NODE, blockCounters);
+            if (threadIdx.x == 0)
+                accepted = version.load(cuda::memory_order_seq_cst) == observed_version;
+            __syncthreads();
+            if (!accepted) {
+                if (threadIdx.x == 0) best_mutex.store(0, cuda::memory_order_release);
+                __syncthreads();
+                continue;
+            }
+            break; 
         }
-        
-        __syncthreads();
+#endif
 
         if(decision == 0){
             
-            if (threadIdx.x == 0) best_mutex.store(0, cuda::memory_order_release);
+
             //__syncthreads();
             endTime(CLASSIFY_NODE,blockCounters);
             
             return;
         }
-        else if(decision == 1 || decision == 2){
-        
-            // overwrite global canon trail and level
-            
-            for (int i = threadIdx.x; i < part.level; i+= blockDim.x)
-                canonical_labeling->invar_path_value[i] = my_canon_code[i];
-            if (threadIdx.x == 0) {
-                
-                 canonical_labeling->level = part.level;
+        else if(decision == 1 || decision == 2) {
+#if USE_BEST_SEQLOCK
+            if (threadIdx.x == 0) version.fetch_add(1, cuda::memory_order_seq_cst);
+#endif
+            __syncthreads();
+            for (int i = threadIdx.x; i < (int)part.level; i += blockDim.x)
+                best_store(canonical_labeling->invar_path_value[i], my_canon_code[i]);
 
-                
-            }
-            // if(threadIdx.x == 0){
-            //   printf("blockID %u is overrideing best path \n", blockIdx.x);
-            // }  
+            if (threadIdx.x == 0) best_store(canonical_labeling->level, (int)part.level);
 
-            if(is_disc){
+            if (is_disc) {
                 discrete_partition_to_perm_p(part, n, tmp_perm);
                 if (threadIdx.x == 0) {
                     int expected = 0;
-                    while (!hash_mutex.compare_exchange_weak(
-                        expected, 1,
-                        cuda::memory_order_acquire,
-                        cuda::memory_order_relaxed)) {
-                        expected = 0;
-                    }
+                    while (!hash_mutex.compare_exchange_weak(expected, 1,
+                            cuda::memory_order_acquire, cuda::memory_order_relaxed)) expected = 0;
                 }
                 __syncthreads();
 
                 buildPermutedFlatAdjacencyMatrixArray_p(graph, tmp_perm, tmp_hash);
                 const unsigned nn = n * n;
-                for (unsigned idx = threadIdx.x; idx < nn; idx += blockDim.x)
-                    canonical_labeling->hash_of_perm_graph[idx] = tmp_hash[idx];
-                
+
+                for (unsigned i = threadIdx.x; i < nn; i += blockDim.x)
+                    best_store(canonical_labeling->hash_of_perm_graph[i], (bool)tmp_hash[i]);
+
                 __syncthreads();
-                if (threadIdx.x == 0)
-                    hash_mutex.store(0, cuda::memory_order_release);
-                __threadfence();
-                
+                if (threadIdx.x == 0) hash_mutex.store(0, cuda::memory_order_release);
 
                 for (unsigned j = threadIdx.x; j < n; j += blockDim.x)
-                    canonical_labeling->label[j] = part.element_vec[j];
-                
-                if (threadIdx.x == 0) canonical_labeling->vertex_sequence_size = part.current_vertex_sequence_size;
-                
+                    best_store(canonical_labeling->label[j], (int)part.element_vec[j]);
+                    
                 for (unsigned i = threadIdx.x; i < part.current_vertex_sequence_size; i += blockDim.x)
-                    canonical_labeling->vertex_sequence[i] = part.current_vertex_sequence[i];
+                    best_store(canonical_labeling->vertex_sequence[i], (unsigned)part.current_vertex_sequence[i]);
 
-                
-                if(threadIdx.x == 0){
-                    canonical_labeling->is_leaf = 1; 
-                    //printf("is canon full path = 1\n");
-                    canonical_labeling->invar_path_value[part.level] = 077777;
-                   
+                if (threadIdx.x == 0) {
+                    best_store(canonical_labeling->vertex_sequence_size, (unsigned)part.current_vertex_sequence_size);
+                    best_store(canonical_labeling->is_leaf, 1);
+                    best_store(canonical_labeling->invar_path_value[part.level], 077777);
                 }
 
-                __syncthreads();
+            } else if (threadIdx.x == 0) best_store(canonical_labeling->is_leaf, 0);
 
-                if (threadIdx.x == 0)
-                    best_mutex.store(0, cuda::memory_order_release);
-                
-
-                backtrack_to_p(part, part.level - 1, n, buffer,
-                            p_eqlev_first, stack_top,tc_level_top);
-
-            
-                __threadfence();
-                endTime(CLASSIFY_NODE,blockCounters);
-                return;
-
-            }
-            else{
-                if(threadIdx.x == 0){
-                    canonical_labeling->is_leaf = 0; 
-                    //printf("is canon full path = 0\n");
-                    // __threadfence();
-                }
-
-                __syncthreads();
-                if(threadIdx.x == 0){
-                     best_mutex.store(0, cuda::memory_order_release);
-                }
-                endTime(CLASSIFY_NODE,blockCounters);
-                return;
-            }
-
-        }
-    
-        else if(decision == 3){
-            // check if eqlevfirst = part.level, if not, backtrack by one.
-
-            int backtrack_level = max(*p_eqlev_first, (canonical_labeling->level) - 1);
-            //int backtrack_level = part.level - 1;
             __syncthreads();
+
+            if (threadIdx.x == 0) {
+#if USE_BEST_SEQLOCK
+                version.fetch_add(1, cuda::memory_order_seq_cst);
+#endif
+                best_mutex.store(0, cuda::memory_order_release);
+            }
+            __syncthreads();
+            if (is_disc) backtrack_to_p(part, part.level - 1, n, buffer,
+                p_eqlev_first, stack_top, tc_level_top);
+
+            endTime(CLASSIFY_NODE, blockCounters);
+            return;
+        }
+
+        else if(decision == 3){
+
+            int backtrack_level = max(*p_eqlev_first, best_level - 1);
             
-            if (threadIdx.x == 0) best_mutex.store(0, cuda::memory_order_release);
-            
-            // if(threadIdx.x == 0){
-            //     printf("value at level %u is %u\n",part.level, backtrack_level);
-            // }
+            __syncthreads();
+        
             if(backtrack_level == part.level && is_disc){
                 backtrack_level--;
             }
@@ -1161,56 +1176,59 @@ __device__ void classify_node(
         }
 
         else if(decision == 4){
-            
-            
-            if (threadIdx.x == 0) best_mutex.store(0, cuda::memory_order_release);
             int backtrack_level = max(*p_eqlev_first, pos);
-            //backtrack_level = min(backtrack_level,level);
-            
-            // if(threadIdx.x == 0){
-            //     if(part.level > backtrack_level +1){
-            //         printf("blockID %u is no longer on best path, backtracking from %u to %u\n", blockIdx.x, part.level, backtrack_level);
-            //     }
-            // }
 
             if ((*p_eqlev_first) != part.level) {
-
-            
-                // if(threadIdx.x == 0){
-                //     printf("blockID %u is no longer on best path, backtracking to %u\n", blockIdx.x, backtrack_level);
-                // }
                 __syncthreads();
                 backtrack_to_p(part, backtrack_level, n, buffer,
                             p_eqlev_first, stack_top, tc_level_top);
             }
             else{
-
                 if(is_disc){
-                    
                     //we might be able to backtrack more here, keep as side note
                     // if(threadIdx.x == 0){
                     //     printf("blockID %u is no longer on best path, backtracking to %u\n", blockIdx.x, part.level - 1);
                     // }
                     backtrack_to_p(part, part.level - 1, n, buffer,
                                 p_eqlev_first, stack_top,tc_level_top);
-
                 }
-               
-
             }
 
             __syncthreads();
             endTime(CLASSIFY_NODE,blockCounters);
             return;
         }
+        else if(decision == 5){
+            if (threadIdx.x == 0) {
+                raw =  atomicAdd((int*)d_num_aut, 1);
+                //printf("blockid: %u level: %u found aut wrt best leaf at index %u and root part level %u \n",blockIdx.x, part.level, raw, tc_level_top[blockIdx.x]);
+            }
+            
+            __syncthreads();
+            for (unsigned i = threadIdx.x; i < n - 1; i += blockDim.x){
+                d_found_automorphisms[raw * n + i] = tmp_perm[i];
+                
+            }
+            __threadfence();
+            __syncthreads();
 
-        // release lock
-        
-        if (threadIdx.x == 0) best_mutex.store(0, cuda::memory_order_release);
+            if(threadIdx.x == 0){
+                publish_automorphism(&d_found_automorphisms[raw * n], n, (int)tmp_perm[n - 1]);
+                __threadfence();
+
+            }
+            __threadfence();
+
+            int g = (int)part.level - 1;
+            backtrack_to_p(part, (unsigned)g, n, buffer,
+                        p_eqlev_first, stack_top,tc_level_top);
+            
+            __syncthreads();
+            
+            endTime(CLASSIFY_NODE,blockCounters);
+            return;
+        }
         endTime(CLASSIFY_NODE,blockCounters);
         __threadfence();
-
-    
-    
 
 }

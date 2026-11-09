@@ -44,6 +44,7 @@ void allocate_canonical_labeling_on_device(
     temp.level = 0;
     temp.is_leaf = 0;
     temp.lock = 0;
+    temp.version = 0;
 
    
     // allocate the struct itself on device + copy the host temp struct into it

@@ -22,25 +22,31 @@
 /* ----------------------------------------------------------------------- */
 
 
-#define NUM_COUNTERS 12
-#define USE_COUNTERS 0
+#define NUM_COUNTERS 13
+#define USE_COUNTERS 1
 
 
 
 
 enum CounterName { ENQUEUE=0, DEQUEUE, WAIT_FIRST_LEAF,  PREPARE_ROOT, 
     PUSH_STACK, POP_STACK, PRUNE_STACK_ENTRY, BACKTRACK, VERIFY_SEQUENCE, CLASSIFY_NODE,
-    SPLIT_BY_AND_REFINE, WAIT_BEST_LEAF_LOCK
+    SPLIT_BY_AND_REFINE, WAIT_BEST_LEAF_LOCK, WAIT_BEST_EVEN_VERSION
 };
 
 
 
 struct Counters {
+    unsigned long long rejected_best_reads;
+    unsigned long long accepted_best_reads;
     unsigned long long tmp[NUM_COUNTERS];
     unsigned long long totalTime[NUM_COUNTERS];
 };
 
 static __device__ void initializeCounters(Counters* counters) {
+    if (threadIdx.x == 0) {
+        counters->rejected_best_reads = 0;
+        counters->accepted_best_reads = 0;
+    }
     #if USE_COUNTERS
     if(threadIdx.x == 0) {
         
@@ -136,6 +142,7 @@ struct CanonicalLabeling {
     volatile int level;
     volatile int is_leaf;
     int lock;
+    unsigned long long version = 0;
     volatile int* invar_path_value; 
  
     

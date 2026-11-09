@@ -77,11 +77,14 @@ __device__ unsigned int* tail(HT* head_tail) {
 	return reinterpret_cast<unsigned int*>(head_tail);
 }
 
-__device__ void waitForTicket(const unsigned int P, const Ticket number, WorkList workList) {
-	while (workList.tickets[P] != number)
-	{
-		backoff();
-	}
+__device__ void waitForTicket(const unsigned int P,const Ticket number,WorkList workList)
+{
+    cuda::atomic_ref<Ticket, cuda::thread_scope_device> ticket(
+        *const_cast<Ticket*>(&workList.tickets[P]));
+
+    while (ticket.load(cuda::memory_order_acquire) != number) {
+        backoff();
+    }
 }
 
 __device__ bool ensureDequeue(WorkList workList){
@@ -171,9 +174,14 @@ __device__ void readData( Partition& out_part, TargetCell& out_tc, int* out_cano
     }
     
 	__syncthreads();
-	if (threadIdx.x==0){
-	    workList.tickets[P] = 2 * ((Pos + workList.size) / workList.size);
-	}
+	if (threadIdx.x == 0) {
+        cuda::atomic_ref<Ticket, cuda::thread_scope_device> ticket(
+            *const_cast<Ticket*>(&workList.tickets[P]));
+
+        ticket.store(
+            2 * ((Pos + workList.size) / workList.size),
+            cuda::memory_order_release);
+    }
 }
 
 __device__ void putData( Partition& in_part,  TargetCell& in_tc, const int* in_canon_code, unsigned int* in_eqlev_first,WorkList workList, unsigned int vertexNum){
@@ -231,11 +239,15 @@ __device__ void putData( Partition& in_part,  TargetCell& in_tc, const int* in_c
     }
 
 	__threadfence();
-	__syncthreads();
-	if (threadIdx.x==0){
-		workList.tickets[P] = B + 1;
-		atomicAdd(&workList.counter->numEnqueued,1);
-	}
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        cuda::atomic_ref<Ticket, cuda::thread_scope_device> ticket(
+            *const_cast<Ticket*>(&workList.tickets[P]));
+
+        ticket.store(B + 1, cuda::memory_order_release);
+        atomicAdd(&workList.counter->numEnqueued, 1);
+    }
 }
 __device__ inline bool enqueue(
     Partition& in_part,
